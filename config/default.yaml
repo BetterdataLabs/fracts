@@ -1,0 +1,13 @@
+test_size: 0.2
+general:
+  sequential:
+    seq_len_list: [32768, 1024, 32, 4, 1]
+    embed_dim_list: [1024, 1024, 512, 256, 128]
+    num_blocks_list: [32, 32, 16, 8, 4]
+    num_heads_list: [16, 16, 8, 8, 4]
+    context_list:
+      - [1, 2, 10]
+      - [1, 2]
+      - [1, 2]
+      - [1, 2]
+      - [1, 2]

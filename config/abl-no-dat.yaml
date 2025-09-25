@@ -1,0 +1,6 @@
+__base__: config/default.yaml
+general:
+  transformer:
+    auxiliary_components: []
+    edit_by_components: []
+    trend_components: []

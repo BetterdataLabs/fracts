@@ -1,0 +1,11 @@
+ctgan
+numpy~=1.26
+pandas~=2.2
+timm
+torch==2.2.2
+tqdm
+PyYAML
+realtabformer
+tensorboard
+transformers==4.46.0
+arfpy

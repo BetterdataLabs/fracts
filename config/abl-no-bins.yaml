@@ -1,0 +1,4 @@
+__base__: config/default.yaml
+general:
+  transformer:
+    n_bins: -1

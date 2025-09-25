@@ -1,0 +1,75 @@
+# Train test split
+test_size: 0.2
+general:
+  transformer:
+    # Data interpretation
+    st_categorical_cols: []
+    st_numeric_cols: []
+    ts_categorical_cols: []
+    ts_numeric_cols: []
+    min_n_continuous: 20
+    dayfirst: false
+    yearfirst: false
+    # Data transformation
+    n_bins: 20
+    auxiliary_components: [
+      "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond",
+      "month_name", "dayofweek", "day_name", "day_to_month_end", "am_pm", "is_month_start", "is_month_end",
+      "is_holiday"
+    ]
+    edit_by_components: [
+        "year", "month_name", "day_name", "day", "day_to_month_end", "is_month_start", "is_month_end",
+        "hour", "am_pm", "minute", "second", "millisecond", "microsecond", "nanosecond"
+    ]
+    # Trend data transformation
+    agg_length: true
+    n_first: 1
+    n_last: 0
+    n_top: 1
+    n_top_prop: 10
+    max_order: 1
+    max_agg_order: 0
+    agg_functions: ["mean", "std"]
+    trend_components: ["day_name", "month_name"]
+  static:
+    model_type: ctgan
+  sequential:
+    seq_len_list: [32768, 1024, 32, 4, 1]
+    embed_dim_list: [1024, 1024, 512, 256, 128]
+    num_blocks_list: [32, 32, 16, 8, 4]
+    num_heads_list: [16, 16, 8, 8, 4]
+    n_ar_layers: -1
+    context_list:
+      - [1, 2, 10]
+      - [1, 2]
+      - [1, 2]
+      - [1, 2]
+      - [1, 2]
+    static_drop_prob: 0.1
+    guiding_loss_weight: 1.0
+    length_loss_weight: 1.0
+    grad_checkpointing: false
+    learnable_pos_emb: false
+    max_batch_size: 1280
+train:
+  static: {}
+  sequential:
+    epochs: 400
+    batch_size: 128
+    num_workers: 4
+    pin_memory: true
+    lr: 5e-5
+    weight_decay: 0.05
+    min_lr: 0.
+    lr_schedule: cosine
+    warmup_epochs: 40
+    grad_clip: 3.0
+    chunk_size: 100
+generate:
+  static: {}
+  sequential:
+    batch_size: 128
+    num_workers: 4
+    pin_memory: true
+    chunk_size: 100
+    num_iter_list: [-1, -1, -1, -1, -1]

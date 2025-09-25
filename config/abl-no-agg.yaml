@@ -1,0 +1,11 @@
+__base__: config/default.yaml
+general:
+  transformer:
+    agg_length: false
+    n_first: 0
+    n_last: 0
+    n_top: 0
+    n_top_prop: 0
+    max_order: 0
+    max_agg_order: 0
+    agg_functions: []
