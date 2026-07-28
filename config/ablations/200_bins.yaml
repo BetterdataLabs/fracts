@@ -2,8 +2,7 @@ __base__: config/default.yaml
 test_size: 0
 general:
   transformer:
-    max_order: 0
-    max_agg_order: 0
+    n_bins: 200
   sequential:
     seq_len_list: [160000, 8000, 400, 20, 1]
     embed_dim_list: [768, 768, 768, 768, 768]
@@ -38,7 +37,7 @@ train:
     validation_freq: 1
     early_stop_patience: 0
     early_stop_delta: 0.0
-    save_epoch: 200
+    save_epoch: 400
     auto_adjust_batch_size: true
     min_batch_size: 1
     max_batch_size: 1024

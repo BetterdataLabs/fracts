@@ -12,6 +12,11 @@ general:
     yearfirst: false
     # Data transformation
     n_bins: 20
+    # Log transform thresholds for skewed/long-tailed numeric columns
+    # Log transform is applied when |skewness| > skew_threshold OR excess_kurtosis > kurtosis_threshold
+    # Set to inf to disable the respective check
+    skew_threshold: 1.0      # Apply log transform when |skewness| > 1.0 (highly skewed)
+    kurtosis_threshold: 3.0  # Apply log transform when excess kurtosis > 3.0 (heavy tails)
     auxiliary_components: [
       "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond",
       "month_name", "dayofweek", "day_name", "day_to_month_end", "am_pm", "is_month_start", "is_month_end",

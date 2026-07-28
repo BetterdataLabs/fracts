@@ -4,11 +4,11 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import nn
 
+from ..dataset.column import SpanType
 from .ar import AR
 from .config import EndGenerator, ModelLoss
 from .last import LastTSFractal
 from .ts_data import DataEncoder
-from ..dataset.column import SpanType
 
 
 class FractalGen(nn.Module, EndGenerator):
@@ -24,9 +24,9 @@ class FractalGen(nn.Module, EndGenerator):
         static_spans: List[Tuple[int, SpanType]],
         data_spans: List[Tuple[int, SpanType]],
         context_list: Tuple[Tuple[int, ...], ...],
-        static_drop_prob: float = 0.0,
+        static_drop_prob: float = 1.0,
         guiding_loss_weight: float = 1.0,
-        length_loss_weight: float = 1.0,
+        length_loss_weight: float = 0.1,
         grad_checkpointing: bool = False,
         use_global_cond: bool = False,
         use_padding_mask: bool = True,
@@ -35,6 +35,11 @@ class FractalGen(nn.Module, EndGenerator):
         prev_level_ctx_len: int = 0,
         learnable_pos_embed: bool = False,
         max_batch_size: int = 65535,
+        
+        use_perceiver: bool = True, 
+        num_latents: int = 16,  # Number of latent tokens (compress 100 conditions → 16 tokens)
+        perceiver_num_heads: int = 8,  # Attention heads for Perceiver
+        perceiver_num_layers: int = 4,  # Cross-attention + self-attention layers
     ):
         """
         Parameters
@@ -63,20 +68,53 @@ class FractalGen(nn.Module, EndGenerator):
             Maximum batch size at each level. The actual batch size of the processing is the specified batch size
             multiplied by the total number of patches in the data, which can be very large in lower levels. This
             parameter aims to control the actual batch size of processing to avoid out of memory at lower levels.
+        use_perceiver : bool
+            If True, use Perceiver-style compression to handle many conditions efficiently.
+        num_latents : int
+            Number of latent tokens when using Perceiver compression.
+        perceiver_num_heads : int
+            Number of attention heads in Perceiver cross/self-attention.
+        perceiver_num_layers : int
+            Number of cross-attention + self-attention layers in Perceiver.
         """
         super().__init__()
+        # Store initialization parameters for test model creation
+        self._init_params = {
+            "seq_len_list": seq_len_list,
+            "embed_dim_list": embed_dim_list,
+            "num_blocks_list": num_blocks_list,
+            "num_heads_list": num_heads_list,
+            "generator_type_list": generator_type_list,
+            "static_spans": static_spans,
+            "data_spans": data_spans,
+            "context_list": context_list,
+            "static_drop_prob": static_drop_prob,
+            "guiding_loss_weight": guiding_loss_weight,
+            "length_loss_weight": length_loss_weight,
+            "grad_checkpointing": grad_checkpointing,
+            "use_global_cond": use_global_cond,
+            "use_padding_mask": use_padding_mask,
+            "transformer_model": transformer_model,
+            "fractal_level": fractal_level,
+            "prev_level_ctx_len": prev_level_ctx_len,
+            "learnable_pos_embed": learnable_pos_embed,
+            "max_batch_size": max_batch_size,
+            "use_perceiver": use_perceiver,
+            "num_latents": num_latents,
+            "perceiver_num_heads": perceiver_num_heads,
+            "perceiver_num_layers": perceiver_num_layers,
+        }
+
         self.fractal_level = fractal_level
         self.num_fractal_levels = len(seq_len_list)
         if fractal_level == 0:
             self.static_encoder = DataEncoder(
-                static_spans, embed_dim_list[0], need_decoder=False
+                static_spans, embed_dim_list[0], need_decoder=False,
+                use_perceiver=use_perceiver, num_latents=num_latents,
+                perceiver_num_heads=perceiver_num_heads, perceiver_num_layers=perceiver_num_layers
             )
             self.static_drop_prob = static_drop_prob
-            prefix_len = len(static_spans)
-            self.fake_static_latent = nn.Parameter(
-                torch.zeros(prefix_len, embed_dim_list[0])
-            )
-            torch.nn.init.normal_(self.fake_static_latent, std=0.02)
+            prefix_len = self.static_encoder.output_num_tokens
         else:
             prefix_len = prev_level_ctx_len
 
@@ -126,6 +164,10 @@ class FractalGen(nn.Module, EndGenerator):
                 use_global_cond=use_global_cond,
                 transformer_model=transformer_model,
                 use_padding_mask=use_padding_mask,
+                use_perceiver=use_perceiver,
+                num_latents=num_latents,
+                perceiver_num_heads=perceiver_num_heads,
+                perceiver_num_layers=perceiver_num_layers,
             )
         else:
             self.next_fractal = LastTSFractal(
@@ -205,15 +247,12 @@ class FractalGen(nn.Module, EndGenerator):
 
     def _process_cond(self, cond: torch.Tensor) -> torch.Tensor:
         if self.fractal_level == 0:
-            static_embedding = self.static_encoder(cond)
-            if self.training:
-                drop_latent_mask = (
-                    torch.rand_like(static_embedding) < self.static_drop_prob
-                ).float()
-                static_embedding = (
-                    drop_latent_mask * self.fake_static_latent
-                    + (1 - drop_latent_mask) * static_embedding
+            if self.training and self.static_drop_prob > 0:
+                static_embedding, _ = self.static_encoder.mask_input(
+                    cond, mask_ratio=self.static_drop_prob
                 )
+            else:
+                static_embedding = self.static_encoder.encode(cond)
             cond = static_embedding
         return cond
 

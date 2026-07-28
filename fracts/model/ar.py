@@ -1,45 +1,31 @@
 import logging
+import math
 from typing import Callable, List, Literal, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
+from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
+from ..dataset.column import SpanType
+from . import kv_cache
 from .config import HighLevelGenerator
 from .ts_data import DataPatcher
 from .utils import find_multiple, get_sinusoidal_pos_embed, init_weights
-from ..dataset.column import SpanType
-
-from transformers import GPT2Config, GPT2Model, LlamaConfig, LlamaModel
-from transformers.models.llama.modeling_llama import LlamaRMSNorm
-import numpy as np
-import math
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.linear1 = nn.Linear(in_dim, out_dim)
-        self.activation = nn.GELU()
-        self.linear2 = nn.Linear(out_dim, out_dim)
-        self.projection = (
-            nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
-        )
-
-    def forward(self, x):
-        residual = self.projection(x)
-        out = self.linear1(x)
-        out = self.activation(out)
-        out = self.linear2(out)
-        return out + residual
-
-
 class AR(nn.Module, HighLevelGenerator):
     """
     AR model for timeseries.
+    
+    Uses Perceiver-compressed condition tokens as prefix in the sequence.
+    The transformer naturally attends to these condition tokens.
     """
 
     def __init__(
@@ -60,6 +46,8 @@ class AR(nn.Module, HighLevelGenerator):
         use_padding_mask: bool = True,
         max_batch_size: int = 65535,
         transformer_model: str = "gpt2",
+        label_smoothing: float = 0.05, 
+        neg_sample_ratio: int = 1,
     ):
         super().__init__()
         self.prefix_len = prefix_len
@@ -83,7 +71,11 @@ class AR(nn.Module, HighLevelGenerator):
             requires_grad=learnable_pos_embed,
         )
 
-        self.cond_emb = nn.Linear(cond_embed_dim, embed_dim)
+        # Only project conditions if dimensions differ
+        self.need_cond_proj = (cond_embed_dim != embed_dim)
+        if self.need_cond_proj:
+            self.cond_emb = nn.Linear(cond_embed_dim, embed_dim)
+            logger.info(f"AR: projecting conditions {cond_embed_dim} -> {embed_dim}")
 
         self.max_seq_len = self.cur_seq_len + self.prefix_len
         logger.info(
@@ -103,9 +95,6 @@ class AR(nn.Module, HighLevelGenerator):
                 pad_token_id=None,
                 bos_token_id=None,
                 eos_token_id=None,
-                attn_pdrop=0.0,
-                embd_pdrop=0.0,
-                resid_pdrop=0.0,
             )
             self.transformer = GPT2Model(config)
             self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
@@ -115,16 +104,12 @@ class AR(nn.Module, HighLevelGenerator):
                 num_hidden_layers=num_blocks,
                 num_attention_heads=num_heads,
                 intermediate_size=int(embed_dim * 4),
-                hidden_act="silu",
                 max_position_embeddings=self.max_seq_len,
-                rms_norm_eps=1e-6,
                 use_cache=False,
                 pad_token_id=None,
                 bos_token_id=None,
                 eos_token_id=None,
-                attention_dropout=0.0,
-                rope_scaling=None,
-                rope_theta=10000.0,
+                attention_dropout=0.1,
             )
             self.transformer = LlamaModel(config)
             self.norm = LlamaRMSNorm(embed_dim, eps=1e-6)
@@ -132,14 +117,15 @@ class AR(nn.Module, HighLevelGenerator):
             raise ValueError(f"Unsupported transformer model {transformer_model}.")
 
         self.len_indicator_predictor = nn.Sequential(
-            nn.Linear(embed_dim * 3, embed_dim * 2),
+            nn.Linear(embed_dim * 3, embed_dim // 2),
             nn.GELU(),
-            ResidualBlock(embed_dim * 2, embed_dim),
-            ResidualBlock(embed_dim, embed_dim // 2),
+            nn.Dropout(0.1),
             nn.Linear(embed_dim // 2, 1),
         )
 
-        self.len_loss = nn.BCEWithLogitsLoss()
+        self.label_smoothing = label_smoothing
+        self.neg_sample_ratio = neg_sample_ratio
+        
         self.data_patcher = DataPatcher(self.patch_size, self.seq_len)
         self.cond_compressor = nn.Sequential(
             nn.Linear(self.prefix_len * cond_embed_dim, embed_dim),
@@ -155,6 +141,7 @@ class AR(nn.Module, HighLevelGenerator):
         attention_mask: torch.Tensor,
         cond: torch.Tensor,
         input_pos: Optional[int] = None,
+        kv_caches: Optional[List] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict next level's conditions.
@@ -169,6 +156,9 @@ class AR(nn.Module, HighLevelGenerator):
             Replacement of cond_list as a combined condition (B, Lc, Ep).
         input_pos : int, optional
             Similarly to image fractal generative model's input.
+        kv_caches : list, optional
+            Per-batch-slice transformer caches, updated in place. When given, only the
+            token that became available at `input_pos` is fed to the transformer.
 
         Returns
         -------
@@ -179,14 +169,23 @@ class AR(nn.Module, HighLevelGenerator):
         """
         next_cond = []
         len_indicator = []
-        for i in range(0, ts_data.shape[0], self.max_batch_size):
+        for slice_idx, i in enumerate(range(0, ts_data.shape[0], self.max_batch_size)):
             this_slice = slice(i, i + self.max_batch_size)
-            this_next_cond, this_len_indicator = self._predict(
+            past = None
+            if kv_caches is not None:
+                while len(kv_caches) <= slice_idx:
+                    kv_caches.append(None)
+                past = kv_caches[slice_idx]
+            this_next_cond, this_len_indicator, past = self._predict(
                 ts_data[this_slice],
                 attention_mask[this_slice],
                 cond[this_slice],
                 input_pos,
+                past,
+                kv_caches is not None,
             )
+            if kv_caches is not None:
+                kv_caches[slice_idx] = past
             next_cond.append(this_next_cond)
             len_indicator.append(this_len_indicator)
         return torch.cat(next_cond, dim=0), torch.cat(len_indicator, dim=0)
@@ -197,82 +196,88 @@ class AR(nn.Module, HighLevelGenerator):
         attention_mask: torch.Tensor,
         cond: torch.Tensor,
         input_pos: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Align embeddings
-        if self.grad_checkpointing:
-            emb_ts = checkpoint(self.patch_emb, ts_data)  # B, L / P, E
+        past_key_values=None,
+        use_kv_cache: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[object]]:
+        incremental = use_kv_cache and input_pos is not None
+        # Checkpointing only trades compute for activation memory, so it is pure
+        # overhead while sampling under `no_grad`.
+        use_ckpt = self.grad_checkpointing and not kv_cache.is_enabled()
+
+        if incremental:
+            emb, past_key_values = self._run_cached_step(
+                ts_data, cond, input_pos, past_key_values
+            )
+            next_emb = emb[:, -1]  # B, E
         else:
-            emb_ts = self.patch_emb(ts_data)
-        if self.grad_checkpointing:
-            cond_emb = checkpoint(self.cond_emb, cond)  # B, Lc, E
-        else:
-            cond_emb = self.cond_emb(cond)
-        if cond_emb.shape[1] != self.prefix_len:
-            raise RuntimeError(
-                f"Condition length {cond_emb.shape[1]} does not match with prefix length {self.prefix_len}."
+            past_key_values = None
+            # Embed time series patches
+            if use_ckpt:
+                emb_ts = checkpoint(self.patch_emb, ts_data)  # B, L / P, E
+            else:
+                emb_ts = self.patch_emb(ts_data)
+
+            cond_emb = self._embed_cond(cond)
+
+            emb = torch.cat([cond_emb, emb_ts], dim=1)
+            emb = emb + self.pos_embed_sin[:, : emb.shape[1]]  # B, L / P + Lc, E
+
+            # Prepare transformer inputs
+            if use_ckpt:
+                emb = checkpoint(self.patch_emb_ln, emb)  # B, L / P + Lc, E
+            else:
+                emb = self.patch_emb_ln(emb)
+
+            attention_mask = torch.cat(
+                [
+                    torch.ones(
+                        attention_mask.shape[0],
+                        self.prefix_len,
+                        dtype=torch.bool,
+                        device=ts_data.device,
+                    ),
+                    attention_mask,
+                ],
+                dim=-1,
             )
 
-        emb = torch.cat([cond_emb, emb_ts], dim=1)
-        emb = emb + self.pos_embed_sin[:, : emb.shape[1]]  # B, L / P + Lc, E
+            if not self.use_padding_mask:
+                attention_mask = torch.ones_like(attention_mask, dtype=torch.bool)
 
-        # Prepare transformer inputs
-        if self.grad_checkpointing:
-            emb = checkpoint(self.patch_emb_ln, emb)  # B, L / P + Lc, E
-        else:
-            emb = self.patch_emb_ln(emb)
+            if input_pos is not None:
+                global_input_pos = input_pos + self.prefix_len - 1
+                end_pos = self.prefix_len if input_pos == 0 else (global_input_pos + 1)
+                emb = emb[:, :end_pos]
+                mask = None
+            else:
+                mask = attention_mask.long()
 
-        attention_mask = torch.cat(
-            [
-                torch.ones(
-                    attention_mask.shape[0],
-                    self.prefix_len,
-                    dtype=torch.bool,
-                    device=ts_data.device,
-                ),
-                attention_mask,
-            ],
-            dim=-1,
-        )
+            # Run through transformer (Perceiver-compressed conditions are prefix tokens)
+            if use_ckpt:
+                self.transformer.gradient_checkpointing_enable()
+            else:
+                self.transformer.gradient_checkpointing_disable()
+            emb = self.transformer(
+                inputs_embeds=emb,
+                attention_mask=mask,
+                use_cache=False,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            ).last_hidden_state
 
-        if not self.use_padding_mask:
-            attention_mask = torch.ones_like(attention_mask, dtype=torch.bool)
+            if use_ckpt:
+                emb = checkpoint(self.norm, emb)  # B, L / P + Lc, E
+            else:
+                emb = self.norm(emb)
 
-        if input_pos is not None:
-            global_input_pos = input_pos + self.prefix_len - 1
-            end_pos = self.prefix_len if input_pos == 0 else (global_input_pos + 1)
-            emb = emb[:, :end_pos]
-            mask = None
-        else:
-            global_input_pos = None
-
-            mask = attention_mask.long()
-
-        if self.grad_checkpointing:
-            self.transformer.gradient_checkpointing_enable()
-        else:
-            self.transformer.gradient_checkpointing_disable()
-        outputs = self.transformer(
-            inputs_embeds=emb,
-            attention_mask=mask,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-
-        emb = outputs.last_hidden_state
-
-        if self.grad_checkpointing:
-            emb = checkpoint(self.norm, emb)  # B, L / P + Lc, E
-        else:
-            emb = self.norm(emb)
+            if input_pos is not None:
+                next_emb = (
+                    emb[:, self.prefix_len - 1] if input_pos == 0 else emb[:, -1]
+                )  # B, E
 
         # Construct context for next level
         if input_pos is not None:
-            if input_pos == 0:
-                next_emb = emb[:, self.prefix_len - 1]  # B, E
-            else:
-                next_emb = emb[:, -1]
             pos_emb_for_len = self.pos_embed_sin[
                 :, self.prefix_len - 1 + input_pos
             ]  # 1, E
@@ -314,7 +319,7 @@ class AR(nn.Module, HighLevelGenerator):
             cond_expanded = cond_expanded.expand(
                 -1, next_emb_with_pos.size(1), -1
             )  # B, L / P, Lc * Ec
-        if self.grad_checkpointing:
+        if use_ckpt:
             cond_compress = checkpoint(
                 self.cond_compressor, cond_expanded
             )  # B, (L / P,) E / 2
@@ -328,13 +333,66 @@ class AR(nn.Module, HighLevelGenerator):
         elif input_pos == 0 and self.use_global_cond:
             ctx_emb = torch.stack([cond_compress, ctx_emb])  # 2, B, E
         combined = torch.cat([next_emb_with_pos, cond_compress], dim=-1)  # B, L / P, 3E
-        if self.grad_checkpointing:
+        if use_ckpt:
             pred_len_indicator = checkpoint(
                 self.len_indicator_predictor, combined
             )  # B, (L / P,) 1
         else:
             pred_len_indicator = self.len_indicator_predictor(combined)
-        return ctx_emb, pred_len_indicator[..., -1]
+        return ctx_emb, pred_len_indicator[..., -1], past_key_values
+
+    def _embed_cond(self, cond: torch.Tensor) -> torch.Tensor:
+        # Project conditions only if dimensions differ
+        if self.need_cond_proj:
+            if self.grad_checkpointing:
+                cond_emb = checkpoint(self.cond_emb, cond)  # B, Lc, E
+            else:
+                cond_emb = self.cond_emb(cond)
+        else:
+            cond_emb = cond  # Already at correct dimension
+
+        if cond_emb.shape[1] != self.prefix_len:
+            raise RuntimeError(
+                f"Condition length {cond_emb.shape[1]} does not match with prefix length {self.prefix_len}."
+            )
+        return cond_emb
+
+    def _run_cached_step(
+        self,
+        ts_data: torch.Tensor,
+        cond: torch.Tensor,
+        input_pos: int,
+        past_key_values,
+    ) -> Tuple[torch.Tensor, object]:
+        """
+        Run the transformer on only the tokens that are new at `input_pos`.
+
+        At `input_pos == 0` that is the whole condition prefix, afterwards it is the
+        single patch produced by the previous step. Attention over the earlier tokens
+        comes from `past_key_values`, so the result matches feeding the full prefix.
+        """
+        if input_pos == 0:
+            step_emb = self._embed_cond(cond)  # B, Lc, E
+            pos_start = 0
+        else:
+            step_emb = self.patch_emb(ts_data[:, input_pos - 1 : input_pos])  # B, 1, E
+            pos_start = self.prefix_len + input_pos - 1
+        step_emb = step_emb + self.pos_embed_sin[
+            :, pos_start : pos_start + step_emb.shape[1]
+        ]
+        step_emb = self.patch_emb_ln(step_emb)
+
+        # Gradient checkpointing silently disables the cache inside transformers.
+        self.transformer.gradient_checkpointing_disable()
+        outputs = self.transformer(
+            inputs_embeds=step_emb,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return self.norm(outputs.last_hidden_state), outputs.past_key_values
 
     def forward(
         self, ts_data: torch.Tensor, len_indicator: torch.Tensor, cond: torch.Tensor
@@ -357,10 +415,12 @@ class AR(nn.Module, HighLevelGenerator):
         filter_len_indicator = (non_empty_patched_len_indicator == -1).all(dim=-1)
 
         target = target_len_indicator[~filter_len_indicator].float()
+        pred = pred_len_indicator[~filter_len_indicator].squeeze(-1).view(-1)
 
-        len_loss = self.len_loss(
-            pred_len_indicator[~filter_len_indicator].squeeze(-1), target
-        )
+        if target.numel() > 0:
+            len_loss = self._compute_balanced_focal_loss(pred, target)
+        else:
+            len_loss = torch.tensor(0.0, device=ts_data.device)
 
         patches_wo_length, patched_len_indicator, patched_cond_next = (
             self.data_patcher.patchify_for_next_level(
@@ -378,6 +438,37 @@ class AR(nn.Module, HighLevelGenerator):
             torch.tensor(0.0, device=ts_data.device),
             len_loss,
         )
+    
+    def _compute_balanced_focal_loss(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute STABLE weighted loss on ALL samples (no sampling).
+        
+        The previous sampling approach caused high variance/oscillation.
+        This uses all samples with proper weighting for stability.
+        """
+        if target.numel() == 0:
+            return torch.tensor(0.0, device=pred.device)
+        
+        num_pos = target.sum()
+        num_neg = target.numel() - num_pos
+        
+        if num_pos == 0:
+            return torch.tensor(0.0, device=pred.device)
+        
+        pos_weight = (num_neg / num_pos).clamp(min=1.0, max=20.0)
+        
+        smooth_target = target * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        
+        loss = F.binary_cross_entropy_with_logits(
+            pred, 
+            smooth_target,
+            pos_weight=pos_weight,
+            reduction='mean'
+        )
+        
+        return loss
 
     def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
         bsz, cur_seq_len, patch_dim = patches.shape
@@ -435,11 +526,9 @@ class AR(nn.Module, HighLevelGenerator):
             next_level_lengths = None
 
         if max_steps + self.prefix_len > self.pos_embed_sin.shape[1]:
-            new_pos_embed = get_sinusoidal_pos_embed(
-                self.prefix_len + max_steps, self.pos_embed_sin.shape[2]
-            )
-            self.pos_embed_sin.data = torch.tensor(
-                new_pos_embed, device=device, dtype=self.pos_embed_sin.dtype
+            raise RuntimeError(
+                f"Cannot handle {max_steps} steps with prefix length {self.prefix_len}, "
+                f"which exceeds the trained maximum {self.pos_embed_sin.shape[1] - self.prefix_len}."
             )
 
         patches = torch.zeros(
@@ -455,6 +544,7 @@ class AR(nn.Module, HighLevelGenerator):
         attention_mask = torch.zeros(bsz, max_steps, dtype=torch.bool, device=device)
         if incomplete_allowed is None:
             incomplete_allowed = torch.ones(bsz, device=device, dtype=torch.bool)
+        kv_caches = [] if kv_cache.use_kv_cache() else None
         for step in range(max_steps):
             if seq_lengths is not None:
                 active_mask = step < seq_lengths
@@ -467,7 +557,7 @@ class AR(nn.Module, HighLevelGenerator):
                 patches = torch.cat([patches, patches], dim=0)
             attention_mask[not_finished, step] = 1
             cond_next, pred_cur_len_indicator = self.predict(
-                patches, attention_mask, cond, step
+                patches, attention_mask, cond, step, kv_caches
             )
             if step == 0 and self.use_global_cond:
                 global_cond, cond_next = cond_next

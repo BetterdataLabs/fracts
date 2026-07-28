@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from ..dataset.column import SpanType
+from . import fast_gpt2, kv_cache
 from .config import EndGenerator, Generator, ModelLoss
 from .ts_data import DataEncoder, DataLoss, DataSampler
 from .utils import init_weights, get_sinusoidal_pos_embed
@@ -18,7 +19,12 @@ logger.setLevel(logging.INFO)
 
 
 class LastTSFractal(nn.Module, Generator, EndGenerator):
-    """Last layer, replacement for pixel loss in images."""
+    """
+    Last layer, replacement for pixel loss in images.
+    
+    Uses Perceiver-compressed condition tokens as prefix in the sequence.
+    The transformer naturally attends to these condition tokens.
+    """
 
     def __init__(
         self,
@@ -55,6 +61,7 @@ class LastTSFractal(nn.Module, Generator, EndGenerator):
         self.max_batch_size = max_batch_size
         self.seq_len = len(spans)
         self.width = sum(w for w, t in spans)
+        self.prev_level_ctx_len = prev_level_ctx_len
         logger.info(
             f"Last level: prefix_len={prev_level_ctx_len}, core_len={self.seq_len}, width={self.width}, transformer_mode={transformer_model}"
         )
@@ -85,9 +92,6 @@ class LastTSFractal(nn.Module, Generator, EndGenerator):
                 pad_token_id=None,
                 bos_token_id=None,
                 eos_token_id=None,
-                attn_pdrop=0.0,
-                embd_pdrop=0.0,
-                resid_pdrop=0.0,
             )
             self.transformer = GPT2Model(config)
             self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
@@ -97,16 +101,12 @@ class LastTSFractal(nn.Module, Generator, EndGenerator):
                 num_hidden_layers=num_blocks,
                 num_attention_heads=num_heads,
                 intermediate_size=int(embed_dim * 4),
-                hidden_act="silu",
                 max_position_embeddings=self.max_seq_len,
-                rms_norm_eps=1e-6,
                 use_cache=False,
                 pad_token_id=None,
                 bos_token_id=None,
                 eos_token_id=None,
-                attention_dropout=0.0,
-                rope_scaling=None,
-                rope_theta=10000.0,
+                attention_dropout=0.1,
             )
             self.transformer = LlamaModel(config)
             self.norm = LlamaRMSNorm(embed_dim, eps=1e-6)
@@ -148,47 +148,145 @@ class LastTSFractal(nn.Module, Generator, EndGenerator):
         return torch.cat(pred, dim=0)
 
     def _predict(self, ts_data: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        # Checkpointing only trades compute for activation memory, so it is pure
+        # overhead while sampling under `no_grad`.
+        use_ckpt = self.grad_checkpointing and not kv_cache.is_enabled()
 
-        if self.grad_checkpointing:
-            cond = checkpoint(self.cond_proj, cond)  # B, Lc, E
+        if use_ckpt:
+            cond_proj = checkpoint(self.cond_proj, cond)  # B, Lc, E
         else:
-            cond = self.cond_proj(cond)
-        if self.grad_checkpointing:
-            ts_data = checkpoint(self.data_encoder, ts_data)  # B, N, E
+            cond_proj = self.cond_proj(cond)
+        if use_ckpt:
+            ts_data_enc = checkpoint(self.data_encoder, ts_data)  # B, N, E
         else:
-            ts_data = self.data_encoder(ts_data)
+            ts_data_enc = self.data_encoder(ts_data)
 
-        data = torch.cat([cond, ts_data], dim=1) + self.pos_embedding  # B, Lc + N, E
+        data = torch.cat([cond_proj, ts_data_enc], dim=1) + self.pos_embedding  # B, Lc + N, E
 
-        if self.grad_checkpointing:
+        if use_ckpt:
             data = checkpoint(self.ln, data)  # B, Lc + N, E
         else:
             data = self.ln(data)
 
-        if self.grad_checkpointing:
+        # Run through transformer (Perceiver-compressed conditions are prefix tokens)
+        if use_ckpt:
             self.transformer.gradient_checkpointing_enable()
         else:
             self.transformer.gradient_checkpointing_disable()
-        outputs = self.transformer(
+        data = self.transformer(
             inputs_embeds=data,
             use_cache=False,
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True,
-        )
+        ).last_hidden_state
 
-        data = outputs.last_hidden_state
-
-        if self.grad_checkpointing:
+        if use_ckpt:
             data = checkpoint(self.norm, data)  # B, Lc + N, E
         else:
             data = self.norm(data)
 
-        ts_data = data[..., -self.seq_len - 1 : -1, :]  # B, N, E
+        ts_data_out = data[..., -self.seq_len - 1 : -1, :]  # B, N, E
         with torch.cuda.amp.autocast(enabled=False):
-            logits = self.data_encoder(ts_data, mode="decode")  # B, Wt
+            logits = self.data_encoder(ts_data_out, mode="decode")  # B, Wt
 
         return logits
+
+    def predict_span(
+        self, ts_data: torch.Tensor, cond: torch.Tensor, step: int, kv_caches: List
+    ) -> torch.Tensor:
+        """
+        KV-cached counterpart of `predict` returning only span `step`'s logits.
+
+        Parameters
+        ----------
+        ts_data : torch.Tensor
+            Data of one time step, spans before `step` already filled (B, Wt).
+        cond : torch.Tensor
+            Condition (B, Lc, Ep).
+        step : int
+            The span to predict.
+        kv_caches : list
+            Per-batch-slice transformer caches, updated in place.
+
+        Returns
+        -------
+        torch.Tensor
+            Logits of span `step`, of shape (B, Ws).
+        """
+        st, ed = int(self.ends[step]), int(self.ends[step + 1])
+        if ts_data.shape[0] == 0:
+            return torch.empty(
+                0, ed - st, device=ts_data.device, dtype=ts_data.dtype
+            )
+
+        decoder = fast_gpt2.decoder_for(self, ts_data.shape[0], self.max_seq_len)
+        if decoder is not None:
+            return self._predict_span_graph(ts_data, cond, step, decoder)
+
+        pred = []
+        for slice_idx, i in enumerate(range(0, ts_data.shape[0], self.max_batch_size)):
+            this_slice = slice(i, i + self.max_batch_size)
+            while len(kv_caches) <= slice_idx:
+                kv_caches.append(None)
+            this_pred, kv_caches[slice_idx] = self._predict_span(
+                ts_data[this_slice], cond[this_slice], step, kv_caches[slice_idx]
+            )
+            pred.append(this_pred)
+        return torch.cat(pred, dim=0)
+
+    def _predict_span_graph(
+        self,
+        ts_data: torch.Tensor,
+        cond: torch.Tensor,
+        step: int,
+        decoder: "fast_gpt2.StaticWindowDecoder",
+    ) -> torch.Tensor:
+        if step == 0:
+            decoder.reset()
+            tokens = self.cond_proj(cond)  # B, Lc, E
+            pos_start = 0
+        else:
+            prev_st, prev_ed = int(self.ends[step - 1]), int(self.ends[step])
+            tokens = self.data_encoder.encode_one(
+                ts_data[..., prev_st:prev_ed], step - 1
+            ).unsqueeze(1)  # B, 1, E
+            pos_start = self.prev_level_ctx_len + step - 1
+        tokens = tokens + self.pos_embedding[:, pos_start : pos_start + tokens.shape[1]]
+        hidden = decoder.forward_tokens(self.ln(tokens))
+        hidden = self.norm(hidden[:, -1])  # B, E
+        with torch.cuda.amp.autocast(enabled=False):
+            return self.data_encoder.decode_one(hidden, step)  # B, Ws
+
+    def _predict_span(
+        self, ts_data: torch.Tensor, cond: torch.Tensor, step: int, past_key_values
+    ) -> Tuple[torch.Tensor, object]:
+        if step == 0:
+            tokens = self.cond_proj(cond)  # B, Lc, E
+            pos_start = 0
+        else:
+            prev_st, prev_ed = int(self.ends[step - 1]), int(self.ends[step])
+            tokens = self.data_encoder.encode_one(
+                ts_data[..., prev_st:prev_ed], step - 1
+            ).unsqueeze(1)  # B, 1, E
+            pos_start = self.prev_level_ctx_len + step - 1
+        tokens = tokens + self.pos_embedding[:, pos_start : pos_start + tokens.shape[1]]
+        tokens = self.ln(tokens)
+
+        # Gradient checkpointing silently disables the cache inside transformers.
+        self.transformer.gradient_checkpointing_disable()
+        outputs = self.transformer(
+            inputs_embeds=tokens,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        hidden = self.norm(outputs.last_hidden_state[:, -1])  # B, E
+        with torch.cuda.amp.autocast(enabled=False):
+            logits = self.data_encoder.decode_one(hidden, step)  # B, Ws
+        return logits, outputs.past_key_values
 
     def forward(
         self, ts_data: torch.Tensor, len_indicator: torch.Tensor, cond: torch.Tensor
@@ -225,15 +323,19 @@ class LastTSFractal(nn.Module, Generator, EndGenerator):
             bsz = cond.shape[0] // 2
         out = torch.zeros(bsz, self.width, device=cond.device)
         sampler = DataSampler(self.spans, temperature)
+        kv_caches = [] if kv_cache.use_kv_cache() else None
 
         for step in range(self.seq_len):
             if cfg == 1.0:
                 to_pred = out
             else:
                 to_pred = torch.cat([out, out], dim=0)
-            logits = self.predict(to_pred, cond)
             st, ed = self.ends[step : step + 2]
-            logits = logits[..., st:ed]  # B, Ws
+            if kv_caches is not None:
+                logits = self.predict_span(to_pred, cond, step, kv_caches)  # B, Ws
+            else:
+                logits = self.predict(to_pred, cond)
+                logits = logits[..., st:ed]  # B, Ws
 
             if not cfg == 1.0:
                 cond_logits = logits[:bsz]

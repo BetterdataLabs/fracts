@@ -1,15 +1,14 @@
 """Timeseries data specific modules."""
 
-from typing import List, Literal, Tuple
+from typing import List, Literal, Optional, Tuple
 
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from .config import ModelLoss
 from .utils import find_multiple, init_weights
-from ..dataset.column import SpanType
+from ..dataset.column import SpanMeta, SpanOrigin, SpanType
 
 
 class Adder(nn.Module):
@@ -23,9 +22,25 @@ class Adder(nn.Module):
 
 class DataEncoder(nn.Module):
     """
-    Encoder transforming data to embeddings.
+    Encoder transforming data to embeddings with optional Perceiver-style compression.
+    
+    For static/condition data with many features (20-100+), use Perceiver mode
+    to compress into a fixed number of latent tokens for efficient conditioning.
     """
-    def __init__(self, spans: List[Tuple[int, SpanType]], embed_dim: int, need_decoder: bool = True):
+    def __init__(
+        self,
+        spans: List[Tuple[int, SpanType]],
+        embed_dim: int,
+        need_decoder: bool = True,
+        span_meta: Optional[List[SpanMeta]] = None,
+       
+        # Perceiver-style compression parameters
+        use_perceiver: bool = False,
+        num_latents: int = 16,
+        perceiver_num_heads: int = 4,
+        perceiver_num_layers: int = 2,
+        perceiver_dropout: float = 0.1,
+    ):
         """
         Parameters
         ----------
@@ -36,8 +51,26 @@ class DataEncoder(nn.Module):
             The output embedded dimension (E).
         need_decoder : bool
             Whether decoder is needed.
+        span_meta : Optional[List[SpanMeta]]
+            Optional metadata for each span, providing information about origin (categorical, binned, etc.)
+            and column name. If provided, must have same length as spans.
+        use_perceiver : bool
+            If True, compress all condition tokens into a fixed number of latent tokens.
+            This is highly recommended for 20+ conditions. Output shape becomes [B, num_latents, E].
+        num_latents : int
+            Number of latent tokens for Perceiver compression (default 16).
+            These tokens learn to capture all relevant condition information.
+        perceiver_num_heads : int
+            Number of attention heads in Perceiver cross-attention.
+        perceiver_num_layers : int
+            Number of Perceiver processing layers (cross-attention + self-attention).
+        perceiver_dropout : float
+            Dropout rate in Perceiver layers.
         """
         super().__init__()
+        if span_meta is not None and len(span_meta) != len(spans):
+            raise ValueError(f"span_meta length ({len(span_meta)}) must match spans length ({len(spans)})")
+        
         col_encoders = []
         col_decoders = []
         for w, t in spans:
@@ -57,8 +90,197 @@ class DataEncoder(nn.Module):
         self.col_encoders = nn.ModuleList(col_encoders)
         self.col_decoders = nn.ModuleList(col_decoders)
         self.spans = spans
+        self.span_meta = span_meta
         self.need_decoder = need_decoder
+        self.embed_dim = embed_dim
+        self.num_input_tokens = len(spans)
+        
+        # Mask embedding for discrete spans (like [MASK] token in NLP)
+        self.mask_embedding = nn.Parameter(torch.zeros(1, embed_dim))
+        nn.init.normal_(self.mask_embedding, std=0.02)
+        
+        # Perceiver-style compression for many conditions
+        self.use_perceiver = use_perceiver
+        self.num_latents = num_latents
+        if use_perceiver:
+            # Learnable latent tokens that will compress all conditions
+            self.latent_tokens = nn.Parameter(torch.zeros(1, num_latents, embed_dim))
+            nn.init.normal_(self.latent_tokens, std=0.02)
+            
+            # Input normalization
+            self.input_norm = nn.LayerNorm(embed_dim, eps=1e-6)
+            
+            # Cross-attention: latents query the condition tokens
+            self.cross_attn_layers = nn.ModuleList()
+            self.cross_attn_norms = nn.ModuleList()
+            self.self_attn_layers = nn.ModuleList()
+            
+            for _ in range(perceiver_num_layers):
+                # Cross-attention: latents attend to conditions
+                self.cross_attn_layers.append(
+                    nn.MultiheadAttention(
+                        embed_dim=embed_dim,
+                        num_heads=perceiver_num_heads,
+                        dropout=perceiver_dropout,
+                        batch_first=True
+                    )
+                )
+                self.cross_attn_norms.append(nn.LayerNorm(embed_dim, eps=1e-6))
+                
+                # Self-attention among latents (to mix information)
+                self.self_attn_layers.append(
+                    nn.TransformerEncoderLayer(
+                        d_model=embed_dim,
+                        nhead=perceiver_num_heads,
+                        dim_feedforward=embed_dim * 4,
+                        dropout=perceiver_dropout,
+                        activation='gelu',
+                        batch_first=True,
+                        norm_first=True
+                    )
+                )
+            
+            # Output projection with gating
+            self.output_gate = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.Sigmoid()
+            )
+            self.output_proj = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim)
+            )
+            # Initialize output near-identity
+            nn.init.zeros_(self.output_proj[-1].weight)
+            nn.init.zeros_(self.output_proj[-1].bias)
+        
         self.apply(init_weights)
+    
+    @property
+    def output_num_tokens(self) -> int:
+        """Number of tokens in the output (after compression if using Perceiver)."""
+        if self.use_perceiver:
+            return self.num_latents
+        return self.num_input_tokens
+
+    def _get_paired_mask_groups(self) -> List[List[int]]:
+        """
+        Get groups of span indices that should share the same mask.
+        
+        For binned numerics, the bin span and value span should be masked together.
+        Other spans are in their own group.
+        
+        Returns
+        -------
+        List[List[int]]
+            List of groups, where each group is a list of span indices that share a mask.
+        """
+        if self.span_meta is None:
+            # No metadata, each span is its own group
+            return [[i] for i in range(len(self.spans))]
+        
+        groups = []
+        visited = set()
+        
+        for i, meta in enumerate(self.span_meta):
+            if i in visited:
+                continue
+            
+            if meta.paired_index is not None:
+                # This span is part of a pair (binned numeric)
+                group = sorted([i, meta.paired_index])
+                groups.append(group)
+                visited.add(i)
+                visited.add(meta.paired_index)
+            else:
+                # Single span
+                groups.append([i])
+                visited.add(i)
+        
+        return groups
+
+    def mask_input(
+        self,
+        x: torch.Tensor,
+        mask_ratio: float = 0.15,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply masking to input data and encode it.
+        
+        For categorical/discrete spans: replace with mask embedding (like [MASK] in NLP).
+        For numerical/continuous spans: zero out the values.
+        For binned numerics: both bin and value spans share the same mask.
+        
+        Parameters
+        ----------
+        x : torch.Tensor
+            The input data, of shape (B, W).
+        mask_ratio : float
+            The ratio of positions to mask (0.0 to 1.0).
+        mask : Optional[torch.Tensor]
+            Pre-computed mask of shape (B, num_groups). If None, will be generated.
+            Each element is True if the group should be masked.
+        
+        Returns
+        -------
+        Tuple[torch.Tensor, torch.Tensor]
+            - Encoded output with masking applied, shape (B, L, E) 
+            - Mask tensor indicating which positions were masked, shape (B, L)
+        """
+        batch_size = x.shape[0]
+        num_spans = len(self.spans)
+        device = x.device
+        
+        # Get paired groups for masking
+        groups = self._get_paired_mask_groups()
+        num_groups = len(groups)
+        
+        # Generate or use provided mask (at group level)
+        if mask is None:
+            # Generate random mask for each group
+            group_mask = torch.rand(batch_size, num_groups, device=device) < mask_ratio
+        else:
+            group_mask = mask
+        
+        # Expand group mask to span-level mask
+        span_mask = torch.zeros(batch_size, num_spans, dtype=torch.bool, device=device)
+        for group_idx, group in enumerate(groups):
+            for span_idx in group:
+                span_mask[:, span_idx] = group_mask[:, group_idx]
+        
+        # Encode with masking
+        out = []
+        st = 0
+        for i, ((w, t), encoder) in enumerate(zip(self.spans, self.col_encoders)):
+            span_x = x[..., st:st + w]
+            
+            if t == SpanType.discrete:
+                ids = span_x.argmax(dim=-1)
+                encoded = encoder(ids)  # (B, E)
+            elif t == SpanType.continuous:
+                encoded = encoder(span_x)  # (B, E)
+            else:
+                raise ValueError(f'Unsupported span type: {t}')
+            
+            # Apply masking
+            mask_i = span_mask[:, i].unsqueeze(-1)  # (B, 1)
+            if t == SpanType.discrete:
+                # For discrete: replace with mask embedding
+                encoded = torch.where(mask_i, self.mask_embedding.expand(batch_size, -1), encoded)
+            else:
+                # For continuous: zero out
+                encoded = torch.where(mask_i, torch.zeros_like(encoded), encoded)
+            
+            out.append(encoded)
+            st += w
+        
+        encoded_output = torch.stack(out, dim=-2)
+        
+        if self.use_perceiver:
+            encoded_output = self._perceiver_compress(encoded_output)
+        
+        return encoded_output, span_mask
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -72,8 +294,12 @@ class DataEncoder(nn.Module):
         Returns
         -------
         torch.Tensor
-            The output data, of shape (B, L, E).
+            The output data:
+            - If use_perceiver=True: (B, num_latents, E) - compressed latent tokens
         """
+        batch_size = x.shape[0]
+        
+        # Step 1: Encode each feature/span to a token
         out = []
         st = 0
         for (w, t), encoder in zip(self.spans, self.col_encoders):
@@ -86,7 +312,115 @@ class DataEncoder(nn.Module):
             else:
                 raise ValueError(f'Unsupported span type: {t}')
             st += w
-        return torch.stack(out, dim=-2)
+        encoded_output = torch.stack(out, dim=-2)  # [B, num_features, E]
+        
+        if self.use_perceiver:
+            encoded_output = self._perceiver_compress(encoded_output)
+           
+        return encoded_output
+
+    def encode_one(self, span_x: torch.Tensor, i: int) -> torch.Tensor:
+        """
+        Encode a single span to its token, matching `encode` for that position.
+
+        Parameters
+        ----------
+        span_x : torch.Tensor
+            Values of span `i` only, of shape (B, w_i).
+        i : int
+            The span index.
+
+        Returns
+        -------
+        torch.Tensor
+            The span token, of shape (B, E).
+        """
+        w, t = self.spans[i]
+        encoder = self.col_encoders[i]
+        if t == SpanType.discrete:
+            return encoder(span_x.argmax(dim=-1))
+        if t == SpanType.continuous:
+            return encoder(span_x)
+        raise ValueError(f'Unsupported span type: {t}')
+
+    def decode_one(self, x: torch.Tensor, i: int) -> torch.Tensor:
+        """
+        Decode a single position's embedding to span `i` logits.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            The embedding of one position, of shape (B, E).
+        i : int
+            The span index.
+
+        Returns
+        -------
+        torch.Tensor
+            Logits for span `i`, of shape (B, w_i).
+        """
+        if not self.need_decoder:
+            raise RuntimeError("The encoder without decoder need cannot run in decode mode.")
+        w, t = self.spans[i]
+        encoder = self.col_encoders[i]
+        decoder = self.col_decoders[i]
+        if t == SpanType.discrete:
+            return decoder(x.matmul(encoder.weight.transpose(0, 1)))
+        if t == SpanType.continuous:
+            return decoder(x)
+        raise ValueError(f'Unsupported span type: {t}')
+
+    def _perceiver_compress(self, condition_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Compress many condition tokens into fewer latent tokens using Perceiver architecture.
+        
+        This is the key to handling 20-100+ conditions efficiently:
+        - Latent tokens learn to specialize (e.g., one for demographics, one for TS stats)
+        - Cross-attention allows latents to selectively gather information
+        - Self-attention mixes information between latents
+        
+        Parameters
+        ----------
+        condition_tokens : torch.Tensor
+            Input condition tokens of shape (B, num_conditions, E)
+        
+        Returns
+        -------
+        torch.Tensor
+            Compressed latent tokens of shape (B, num_latents, E)
+        """
+        B = condition_tokens.shape[0]
+        
+        # Normalize input conditions
+        condition_tokens = self.input_norm(condition_tokens)
+        
+        # Initialize latents
+        latents = self.latent_tokens.expand(B, -1, -1)  # [B, num_latents, E]
+        
+        # Iterative cross-attention and self-attention
+        for cross_attn, cross_norm, self_attn in zip(
+            self.cross_attn_layers, 
+            self.cross_attn_norms, 
+            self.self_attn_layers
+        ):
+            # Cross-attention: latents query the conditions
+            # This is where latents gather information from all conditions
+            cross_out, _ = cross_attn(
+                query=latents,
+                key=condition_tokens,
+                value=condition_tokens
+            )
+            latents = cross_norm(latents + cross_out)  # Residual + norm
+            
+            # Self-attention: latents communicate with each other
+            latents = self_attn(latents)
+        
+        # Output projection with gating (controls how much new info to add)
+        gate = self.output_gate(latents)
+        proj = self.output_proj(latents)
+        latents = latents + gate * proj  # Gated residual
+        
+        return latents
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """

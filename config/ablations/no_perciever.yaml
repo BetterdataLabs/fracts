@@ -1,9 +1,6 @@
 __base__: config/default.yaml
 test_size: 0
 general:
-  transformer:
-    max_order: 0
-    max_agg_order: 0
   sequential:
     seq_len_list: [160000, 8000, 400, 20, 1]
     embed_dim_list: [768, 768, 768, 768, 768]
@@ -20,6 +17,7 @@ general:
     use_global_cond: true
     transformer_model: "gpt2"
     static_drop_prob: 0.3
+    use_perceiver: false
   static:
     model_type: ctgan
 train:

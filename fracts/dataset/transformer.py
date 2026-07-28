@@ -8,7 +8,17 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from tqdm import tqdm
 
-from .column import ColumnTransformer, DataType, SpanType, column_transformers
+from .column import (
+    CategoricalTransformer,
+    ColumnTransformer,
+    DataType,
+    DatetimeTransformer,
+    NumericTransformer,
+    SpanMeta,
+    SpanOrigin,
+    SpanType,
+    column_transformers,
+)
 from .data import TSData
 from .trend import TrendColumnTransformer, trend_transformers
 from .utils import extract, flatten_columns
@@ -31,10 +41,19 @@ class TSDataTransformer:
       (recognized by `pd.to_datetime` and `pd.to_numeric`).
     - All static and timeseries columns have different names, and column names do not contain the character ".".
     """
+
     def __init__(
-            self, min_n_continuous: int = 20, dayfirst: bool = False, yearfirst: bool = False, agg_length: bool = True,
-            st_categorical_cols: List[str] = None, st_numeric_cols: List[str] = None, ts_categorical_cols: List[str] = None,
-            ts_numeric_cols: List[str] = None,  **kwargs):
+        self,
+        min_n_continuous: int = 20,
+        dayfirst: bool = False,
+        yearfirst: bool = False,
+        agg_length: bool = True,
+        st_categorical_cols: List[str] = None,
+        st_numeric_cols: List[str] = None,
+        ts_categorical_cols: List[str] = None,
+        ts_numeric_cols: List[str] = None,
+        **kwargs,
+    ):
         """
         Parameters
         ----------
@@ -54,14 +73,12 @@ class TSDataTransformer:
         self.dayfirst = dayfirst
         self.yearfirst = yearfirst
         self._column_params = {
-            t: {
-                k: v for k, v in kwargs.items() if k in transformer.params
-            } for t, transformer in column_transformers.items()
+            t: {k: v for k, v in kwargs.items() if k in transformer.params}
+            for t, transformer in column_transformers.items()
         }
         self._trend_params = {
-            t: {
-                k: v for k, v in kwargs.items() if k in transformer.params
-            } for t, transformer in trend_transformers.items()
+            t: {k: v for k, v in kwargs.items() if k in transformer.params}
+            for t, transformer in trend_transformers.items()
         }
 
         self.st_num_cols = []
@@ -80,8 +97,13 @@ class TSDataTransformer:
         self.ts_dat_cols = []
         self.static_transformers: Dict[str, ColumnTransformer] = {}
         self.trend_transformers: Dict[str, TrendColumnTransformer] = {}
-        self.len_transformer = column_transformers[DataType.numeric](**self._column_params[DataType.numeric]) \
-            if agg_length else None
+        self.len_transformer = (
+            column_transformers[DataType.numeric](
+                **self._column_params[DataType.numeric]
+            )
+            if agg_length
+            else None
+        )
         self.max_len = 0
 
     def fit(self, data: TSData):
@@ -109,9 +131,16 @@ class TSDataTransformer:
                     elif pd.to_numeric(col_value, errors="coerce").notna().all():
                         self.st_num_cols.append(c)
                         dtype = DataType.numeric
-                    elif pd.to_datetime(
-                            col_value, errors="coerce", dayfirst=self.dayfirst, yearfirst=self.yearfirst
-                    ).notna().all():
+                    elif (
+                        pd.to_datetime(
+                            col_value,
+                            errors="coerce",
+                            dayfirst=self.dayfirst,
+                            yearfirst=self.yearfirst,
+                        )
+                        .notna()
+                        .all()
+                    ):
                         self.st_dat_cols.append(c)
                         dtype = DataType.datetime
                     else:
@@ -136,9 +165,16 @@ class TSDataTransformer:
                 col_value = ts_data[c]
                 if pd.to_numeric(col_value, errors="coerce").isna().any():
                     num_possible[c] = False
-                if pd.to_datetime(
-                        col_value, errors="coerce", dayfirst=self.dayfirst, yearfirst=self.yearfirst
-                ).isna().any():
+                if (
+                    pd.to_datetime(
+                        col_value,
+                        errors="coerce",
+                        dayfirst=self.dayfirst,
+                        yearfirst=self.yearfirst,
+                    )
+                    .isna()
+                    .any()
+                ):
                     dat_possible[c] = False
         lengths = pd.Series(lengths)
         if self.len_transformer is not None:
@@ -172,7 +208,9 @@ class TSDataTransformer:
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         logger.info(f"Fitting transformer time: {total_time_str}")
 
-    def get_static(self, data: TSData, normalize: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def get_static(
+        self, data: TSData, normalize: bool = False
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Get static data, including static columns and aggregated timeseries information.
 
@@ -237,7 +275,9 @@ class TSDataTransformer:
         if len(self.static_transformers) == 0:
             return pd.DataFrame(index=static.index)
         result = {}
-        for c, transformer in tqdm(self.static_transformers.items(), "Transforming static"):
+        for c, transformer in tqdm(
+            self.static_transformers.items(), "Transforming static"
+        ):
             if normalize:
                 result[c] = transformer.normalize(static[c])
             else:
@@ -246,7 +286,9 @@ class TSDataTransformer:
         static = flatten_columns(static)
         return static
 
-    def get_timeseries(self, data: TSData, chunk_size: int = 100, cache_dir: str = "data-cache") -> TSData:
+    def get_timeseries(
+        self, data: TSData, chunk_size: int = 100, cache_dir: str = "data-cache"
+    ) -> TSData:
         """
         Get timeseries data, including static components (normalized version of `.get_static` result).
 
@@ -270,7 +312,10 @@ class TSDataTransformer:
         lengths = {}
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(os.path.join(cache_dir, "ts"), exist_ok=True)
-        pbar = tqdm(desc="Transforming timeseries", total=len(data) * len(self.trend_transformers))
+        pbar = tqdm(
+            desc="Transforming timeseries",
+            total=len(data) * len(self.trend_transformers),
+        )
         columns = None
         for st in range(0, len(data), chunk_size):
             ts_data, static_data = data.get_batch(slice(st, st + chunk_size))
@@ -295,11 +340,12 @@ class TSDataTransformer:
             aggregated = flatten_columns(aggregated)
             all_aggregated.append(aggregated.loc[static_data.index])
 
-
             for sid, one_ts_data in ts_transformed.items():
                 one_ts_data = pd.concat(one_ts_data, axis=1)
                 one_ts_data = flatten_columns(one_ts_data)
-                one_ts_data.to_csv(os.path.join(cache_dir, "ts", f"{sid}.csv"), index=False)
+                one_ts_data.to_csv(
+                    os.path.join(cache_dir, "ts", f"{sid}.csv"), index=False
+                )
                 if self.len_transformer is not None:
                     lengths[sid] = one_ts_data.shape[0]
 
@@ -313,16 +359,8 @@ class TSDataTransformer:
         else:
             static_transformed = all_static
 
-        # columns = all_aggregated[0].columns
-        # for i, item in enumerate(all_aggregated):
-        #     if not item.columns.equals(columns):
-        #         logger.warning(f"Columns mismatch in aggregated data at index {i}: {item.columns.tolist()} vs {columns.tolist()}")
-        #         missing_cols = columns.difference(item.columns)
-        #         if len(missing_cols) > 0:
-        #             logger.warning(f"Missing columns in aggregated data at index {i}: {missing_cols.tolist()}")
-                
         all_aggregated = pd.concat(all_aggregated)
-        
+
         if self.len_transformer is not None:
             lengths = pd.Series(lengths)
             lengths = self.len_transformer.normalize(lengths)
@@ -330,11 +368,15 @@ class TSDataTransformer:
         else:
             lengths = pd.DataFrame(index=all_aggregated.index)
 
-        static_combined = pd.concat([static_transformed, lengths, all_aggregated], axis=1).loc[static_transformed.index]
+        static_combined = pd.concat(
+            [static_transformed, lengths, all_aggregated], axis=1
+        ).loc[static_transformed.index]
 
         static_combined.to_csv(os.path.join(cache_dir, "static.csv"), index_label=".id")
 
-        all_ts_data = TSData(os.path.join(cache_dir, "ts"), os.path.join(cache_dir, "static.csv"), ".id")
+        all_ts_data = TSData(
+            os.path.join(cache_dir, "ts"), os.path.join(cache_dir, "static.csv"), ".id"
+        )
         return all_ts_data
 
     def get_norm_ts_cond(self, static: pd.DataFrame, agg: pd.DataFrame) -> pd.DataFrame:
@@ -362,7 +404,9 @@ class TSDataTransformer:
                 len_data = extract(agg, ".length")
                 recov_len = self.len_transformer.inverse_standardize(len_data)
                 length = self.len_transformer.normalize(recov_len)
-                length = length.set_axis([f".length.{c}" for c in length.columns], axis=1)
+                length = length.set_axis(
+                    [f".length.{c}" for c in length.columns], axis=1
+                )
             else:
                 length = pd.DataFrame(index=agg.index)
 
@@ -378,8 +422,11 @@ class TSDataTransformer:
             return static
 
     def recover(
-            self, data: TSData, static_standardized: Optional[pd.DataFrame] = None,
-            chunk_size: int = 100, cache_dir: str = "data-cache"
+        self,
+        data: TSData,
+        static_standardized: Optional[pd.DataFrame] = None,
+        chunk_size: int = 100,
+        cache_dir: str = "data-cache",
     ) -> TSData:
         """
         Recover normalized timeseries data to raw format. This is the inverse process of `.get_timeseries` (or
@@ -416,21 +463,33 @@ class TSDataTransformer:
         os.makedirs(cache_dir, exist_ok=True)
         if static is not None:
             static.to_csv(os.path.join(cache_dir, "static.csv"), index_label=".id")
+        else:
+            pd.DataFrame(index=data.static_ids).to_csv(
+                os.path.join(cache_dir, "static.csv"), index_label=".id"
+            )
         os.makedirs(os.path.join(cache_dir, "ts"), exist_ok=True)
         for st in range(0, len(data), chunk_size):
             ts_data, static_data = data.get_batch(slice(st, st + chunk_size))
             ts_recovered = collections.defaultdict(dict)
             for c, transformer in self.trend_transformers.items():
                 col_data = {sid: extract(d, c) for sid, d in ts_data.items()}
-                col_recovered = transformer.inverse_transform(col_data, extract(static_data, c), True)
+                col_recovered = transformer.inverse_transform(
+                    col_data, extract(static_data, c), True
+                )
                 for sid, d in col_recovered.items():
                     ts_recovered[sid][c] = d
             for sid, one_ts_data in ts_recovered.items():
-                pd.DataFrame(one_ts_data).to_csv(os.path.join(cache_dir, "ts", f"{sid}.csv"), index=False)
+                pd.DataFrame(one_ts_data).to_csv(
+                    os.path.join(cache_dir, "ts", f"{sid}.csv"), index=False
+                )
 
-        return TSData(os.path.join(cache_dir, "ts"), os.path.join(cache_dir, "static.csv"), ".id")
+        return TSData(
+            os.path.join(cache_dir, "ts"), os.path.join(cache_dir, "static.csv"), ".id"
+        )
 
-    def recover_static_standardized(self, static_standardized: pd.DataFrame) -> pd.DataFrame:
+    def recover_static_standardized(
+        self, static_standardized: pd.DataFrame
+    ) -> pd.DataFrame:
         """
         Recover static standardized data.
 
@@ -454,25 +513,36 @@ class TSDataTransformer:
         return static
 
     @property
-    def static_standardized_types(self) -> Tuple[Dict[str, DataType], Dict[str, DataType]]:
+    def static_standardized_types(
+        self,
+    ) -> Tuple[Dict[str, DataType], Dict[str, DataType]]:
         """
         Static standardized data types, with static and aggregated parts separated.
         """
         static_types = {
-            f"{c}.{sc}": t for c, transformer in self.static_transformers.items()
+            f"{c}.{sc}": t
+            for c, transformer in self.static_transformers.items()
             for sc, t in transformer.standardized_types.items()
         }
-        len_types = {} if self.len_transformer is None else {
-            f".length.{sc}": t for sc, t in self.len_transformer.standardized_types.items()
-        }
+        len_types = (
+            {}
+            if self.len_transformer is None
+            else {
+                f".length.{sc}": t
+                for sc, t in self.len_transformer.standardized_types.items()
+            }
+        )
         agg_types = {
-            f"{c}.{sc}": t for c, transformer in self.trend_transformers.items()
+            f"{c}.{sc}": t
+            for c, transformer in self.trend_transformers.items()
             for sc, t in transformer.standardized_aggregated_types.items()
         }
         return static_types, len_types | agg_types
 
     @property
-    def static_spans(self) -> Tuple[List[Tuple[int, SpanType]], List[Tuple[int, SpanType]]]:
+    def static_spans(
+        self,
+    ) -> Tuple[List[Tuple[int, SpanType]], List[Tuple[int, SpanType]]]:
         """
         Static data spans, with static and aggregated parts separated.
         """
@@ -508,4 +578,75 @@ class TSDataTransformer:
         for c, transformer in self.trend_transformers.items():
             results.extend(transformer.spans)
         results = [(w, t) for w, t in results if w > 0]
+        return results
+
+    def span_meta(self):
+        """
+        Build span metadata for timeseries data spans.
+
+        Returns
+        -------
+        List[SpanMeta]
+            Metadata for each span, including origin type, column name, and paired index for binned numerics.
+        """
+
+        results = []
+        for col_name, trend_transformer in self.trend_transformers.items():
+            col_transformer = trend_transformer.column_transformer
+            col_spans = trend_transformer.spans
+
+            # Determine the type of column transformer
+            if isinstance(col_transformer, NumericTransformer):
+                has_binning = col_transformer.kmeans is not None
+                if has_binning:
+                    # Binned numeric produces 2 spans: (discrete bins, continuous value)
+                    span_idx = 0
+                    for w, t in col_spans:
+                        if w <= 0:
+                            continue
+                        if t == SpanType.discrete:
+                            base_idx = len(results)
+                            results.append(SpanMeta(
+                                origin=SpanOrigin.numeric_binned,
+                                column_name=col_name,
+                                paired_index=base_idx + 1
+                            ))
+                        elif t == SpanType.continuous:
+                            results.append(SpanMeta(
+                                origin=SpanOrigin.numeric_value,
+                                column_name=col_name,
+                                paired_index=len(results) - 1
+                            ))
+                        span_idx += 1
+                else:
+                    # Unbinned numeric produces 1 continuous span
+                    for w, t in col_spans:
+                        if w <= 0:
+                            continue
+                        results.append(SpanMeta(
+                            origin=SpanOrigin.numeric_value,
+                            column_name=col_name,
+                            paired_index=None
+                        ))
+            elif isinstance(col_transformer, CategoricalTransformer):
+                for w, t in col_spans:
+                    if w <= 0:
+                        continue
+                    results.append(SpanMeta(
+                        origin=SpanOrigin.categorical,
+                        column_name=col_name,
+                        paired_index=None
+                    ))
+            elif isinstance(col_transformer, DatetimeTransformer):
+                for w, t in col_spans:
+                    if w <= 0:
+                        continue
+                    results.append(SpanMeta(
+                        origin=SpanOrigin.datetime_component,
+                        column_name=col_name,
+                        paired_index=None
+                    ))
+            else:
+                raise ValueError(f"Unknown column transformer type for column {col_name}")
+
         return results

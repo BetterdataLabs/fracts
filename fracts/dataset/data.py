@@ -106,7 +106,7 @@ class TSData:
             yield self[i]
 
     def split(self, test_size: float = 0.2, stratify: Optional[str] = None,
-              out_path: Optional[str] = None) -> Tuple["TSData", "TSData"]:
+              out_path: Optional[str] = None, random_state: Optional[int] = None) -> Tuple["TSData", "TSData"]:
         """
         Split the dataset for training and test sets.
 
@@ -135,7 +135,7 @@ class TSData:
 
         if test_size > 0:
             train_static_ids, test_static_ids = train_test_split(
-                self.static_ids, test_size=test_size, stratify=stratify
+                self.static_ids, test_size=test_size, stratify=stratify, random_state=random_state
             )
         else:
             train_static_ids = self.static_ids

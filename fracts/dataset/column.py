@@ -1,11 +1,14 @@
 import enum
 import inspect
+import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Literal, Tuple, Union
+from dataclasses import dataclass
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
+from scipy.stats import kurtosis, skew
 from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder, StandardScaler
 
 from .utils import extract, flatten_columns
@@ -24,10 +27,38 @@ class SpanType(enum.Enum):
     """Continuous spans."""
 
 
+class SpanOrigin(enum.Enum):
+    """Origin type of a span, indicating where it came from."""
+    categorical = enum.auto()        # Inherently discrete (e.g., category column)
+    numeric_binned = enum.auto()     # Discrete from binning
+    numeric_value = enum.auto()      # Continuous scaled value
+    datetime_component = enum.auto() # Datetime derived component
+
+
+@dataclass
+class SpanMeta:
+    """
+    Metadata for a span, providing additional context about its origin.
+
+    Attributes
+    ----------
+    origin : SpanOrigin
+        The origin type of this span.
+    column_name : str
+        The original column name this span belongs to.
+    paired_index : Optional[int]
+        For binned numerics, the index of the paired span (bin ↔ value).
+    """
+    origin: SpanOrigin
+    column_name: str
+    paired_index: Optional[int] = None
+
+
 class ColumnTransformer(ABC):
     """
     Data transformer for a column.
     """
+
     dtype: DataType = None
     """
     The data type for this transformer.
@@ -36,6 +67,7 @@ class ColumnTransformer(ABC):
     """
     Pandas data type for intermediate processing the raw data.
     """
+
     def __init__(self):
         pass
 
@@ -163,6 +195,7 @@ class CategoricalTransformer(ColumnTransformer):
     """
     Data transformer for a categorical column.
     """
+
     dtype = DataType.categorical
     pd_dtype = "string"
 
@@ -170,8 +203,10 @@ class CategoricalTransformer(ColumnTransformer):
         super().__init__()
         self.oe = OneHotEncoder(sparse_output=False)
 
-    params = (set(inspect.signature(ColumnTransformer).parameters) |
-              set(inspect.signature(__init__).parameters)) - {"self"}
+    params = (
+        set(inspect.signature(ColumnTransformer).parameters)
+        | set(inspect.signature(__init__).parameters)
+    ) - {"self"}
 
     def _fit(self, data: pd.Series):
         self.oe.fit(data.values.reshape((-1, 1)))
@@ -188,7 +223,11 @@ class CategoricalTransformer(ColumnTransformer):
 
     def _normalize(self, data: pd.Series) -> pd.DataFrame:
         result = self.oe.transform(data.values.reshape((-1, 1)))
-        result = pd.DataFrame(result, columns=[f"cat-{i:02d}" for i in range(result.shape[1])], index=data.index)
+        result = pd.DataFrame(
+            result,
+            columns=[f"cat-{i:02d}" for i in range(result.shape[1])],
+            index=data.index,
+        )
         return result
 
     def inverse_normalize(self, data: pd.DataFrame) -> pd.Series:
@@ -208,31 +247,103 @@ class NumericTransformer(ColumnTransformer):
     """
     Data transformer for a numeric column.
     """
+
     dtype = DataType.numeric
     pd_dtype = "float"
 
-    def __init__(self, n_bins: int = 20):
+    def __init__(
+        self,
+        n_bins: int = 20,
+        skew_threshold: float = 1.0,
+        kurtosis_threshold: float = 3.0,
+    ):
         """
         Parameters
         ----------
         n_bins : int
             The guiding KMeans number of bins. If the value is non-positive, no guiding bins will be applied.
+        skew_threshold : float
+            Absolute skewness threshold above which log transform is automatically applied.
+            Uses signed log transform to handle negative values and zeros: sign(x) * log1p(|x|).
+            Default 1.0 (highly skewed). Set to float('inf') to disable skewness check.
+        kurtosis_threshold : float
+            Excess kurtosis threshold above which log transform is automatically applied.
+            Helps handle long-tailed distributions. Default 3.0 (heavy tails).
+            Normal distribution has excess kurtosis of 0. Set to float('inf') to disable kurtosis check.
         """
         super().__init__()
-        self.kmeans = KBinsDiscretizer(n_bins=n_bins, strategy="kmeans", encode="onehot-dense") if n_bins > 0 else None
+        self.kmeans = (
+            KBinsDiscretizer(n_bins=n_bins, strategy="kmeans", encode="onehot-dense")
+            if n_bins > 0
+            else None
+        )
         self.scaler = StandardScaler()
+        self.skew_threshold = skew_threshold
+        self.kurtosis_threshold = kurtosis_threshold
+        self._use_log_transform = False  # Determined during fit
 
-    params = (set(inspect.signature(ColumnTransformer).parameters) |
-              set(inspect.signature(__init__).parameters)) - {"self"}
+    params = (
+        set(inspect.signature(ColumnTransformer).parameters)
+        | set(inspect.signature(__init__).parameters)
+    ) - {"self"}
+
+    def _apply_log_transform(self, data: np.ndarray) -> np.ndarray:
+        """
+        Apply signed log transform: sign(x) * log1p(|x|).
+
+        This handles:
+        - Positive values: log1p(x)
+        - Negative values: -log1p(|x|)
+        - Zeros: 0 (since log1p(0) = 0)
+        """
+        return np.sign(data) * np.log1p(np.abs(data))
+
+    def _inverse_log_transform(self, data: np.ndarray) -> np.ndarray:
+        """
+        Apply inverse signed log transform: sign(x) * expm1(|x|).
+        """
+        return np.sign(data) * np.expm1(np.abs(data))
 
     def _fit(self, data: pd.Series):
+
+        if len(data) > 1 and data.max() - data.min() > 1e-6:
+            data_skewness = abs(skew(data))
+            data_kurtosis = kurtosis(data)
+            is_skewed = data_skewness > self.skew_threshold
+            is_long_tailed = data_kurtosis > self.kurtosis_threshold
+            self._use_log_transform = bool(is_skewed or is_long_tailed)
+        else:
+            self._use_log_transform = False
+
+        # Apply log transform if threshold exceeded
+        if self._use_log_transform:
+            data = pd.Series(self._apply_log_transform(data.values), index=data.index)
+
+        # Adapt n_bins from data when KMeans binning is enabled
+        if self.kmeans is not None:
+            n_unique = len(data.unique())
+            n_rows = len(data.dropna())
+            if n_unique <= 10:
+                n_bins = n_unique
+            else:
+                n_bins = min(int(self.kmeans.n_bins), max(n_rows // 10, 1))
+            # KBinsDiscretizer requires at least 2 bins
+            if n_bins < 2 or n_rows < n_bins:
+                warnings.warn(
+                    f"Not enough samples ({n_rows}) or unique values ({n_unique}) "
+                    f"to fit KBinsDiscretizer with n_bins={n_bins}. Skipping binning."
+                )
+                self.kmeans = None
+            else:
+                self.kmeans.n_bins = n_bins
+
         fit_kmeans = self.kmeans is not None and data.max() - data.min() > 1e-6
-        data = data.values.reshape((-1, 1))
+        data_values = data.values.reshape((-1, 1))
         if fit_kmeans:
-            self.kmeans.fit(data)
+            self.kmeans.fit(data_values)
         else:
             self.kmeans = None
-        self.scaler.fit(data)
+        self.scaler.fit(data_values)
 
     def _standardize(self, data: pd.Series) -> pd.DataFrame:
         return data.to_frame("val")
@@ -245,13 +356,20 @@ class NumericTransformer(ColumnTransformer):
         return {"val": DataType.numeric}
 
     def _normalize(self, data: pd.Series) -> pd.DataFrame:
-        values = data.values.reshape((-1, 1))
+        # Apply log transform if threshold was exceeded during fit
+        if self._use_log_transform:
+            values = self._apply_log_transform(data.values).reshape((-1, 1))
+        else:
+            values = data.values.reshape((-1, 1))
+
         if self.kmeans is None:
             bin_data = pd.DataFrame(index=data.index)
         else:
             bin_data = self.kmeans.transform(values)
             bin_data = pd.DataFrame(
-                bin_data, columns=[f"bin-{i:02d}" for i in range(bin_data.shape[1])], index=data.index
+                bin_data,
+                columns=[f"bin-{i:02d}" for i in range(bin_data.shape[1])],
+                index=data.index,
             )
         scaled_data = self.scaler.transform(values)[:, 0]
         scaled_data = pd.Series(scaled_data, index=data.index).to_frame("val")
@@ -260,6 +378,11 @@ class NumericTransformer(ColumnTransformer):
     def inverse_normalize(self, data: pd.DataFrame) -> pd.Series:
         scaled = data[["val"]].values
         recovered = self.scaler.inverse_transform(scaled)[:, 0]
+
+        # Apply inverse log transform if it was used during fit
+        if self._use_log_transform:
+            recovered = self._inverse_log_transform(recovered)
+
         return pd.Series(recovered, index=data.index)
 
     @property
@@ -267,7 +390,10 @@ class NumericTransformer(ColumnTransformer):
         if self.kmeans is None:
             return [(1, SpanType.continuous)]
         else:
-            return [(self.kmeans.n_bins_[0], SpanType.discrete), (1, SpanType.continuous)]
+            return [
+                (self.kmeans.n_bins_[0], SpanType.discrete),
+                (1, SpanType.continuous),
+            ]
 
     @property
     def normalized_columns(self) -> List[str]:
@@ -279,8 +405,23 @@ class NumericTransformer(ColumnTransformer):
 
 
 dt_components = Literal[
-    "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond",
-    "month_name", "dayofweek", "day_name", "day_to_month_end", "am_pm", "is_month_start", "is_month_end", "is_holiday"
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "month_name",
+    "dayofweek",
+    "day_name",
+    "day_to_month_end",
+    "am_pm",
+    "is_month_start",
+    "is_month_end",
+    "is_holiday",
 ]
 holiday_calendar = USFederalHolidayCalendar()
 # holiday refers to US federal holiday
@@ -290,20 +431,48 @@ class DatetimeTransformer(ColumnTransformer):
     """
     Data transformer for a datetime column.
     """
+
     dtype = DataType.datetime
     pd_dtype = "datetime64[ns]"
 
     def __init__(
-            self, auxiliary_components: List[dt_components] = [
-                "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond",
-                "month_name", "dayofweek", "day_name", "day_to_month_end", "am_pm", "is_month_start", "is_month_end",
-                "is_holiday"
-            ],
-            edit_by_components: List[dt_components] = [
-                "year", "month_name", "day_name", "day", "day_to_month_end", "is_month_start", "is_month_end",
-                "hour", "am_pm", "minute", "second", "millisecond", "microsecond", "nanosecond"
-            ],
-            **kwargs
+        self,
+        auxiliary_components: List[dt_components] = [
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+            "month_name",
+            "dayofweek",
+            "day_name",
+            "day_to_month_end",
+            "am_pm",
+            "is_month_start",
+            "is_month_end",
+            "is_holiday",
+        ],
+        edit_by_components: List[dt_components] = [
+            "year",
+            "month_name",
+            "day_name",
+            "day",
+            "day_to_month_end",
+            "is_month_start",
+            "is_month_end",
+            "hour",
+            "am_pm",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+        ],
+        **kwargs,
     ):
         """
         Parameters
@@ -324,7 +493,9 @@ class DatetimeTransformer(ColumnTransformer):
         self.auxiliary_components = auxiliary_components
         self.edit_by_components = edit_by_components
         if not set(edit_by_components) <= set(auxiliary_components):
-            raise ValueError("Edit components must be a subset of all auxiliary components.")
+            raise ValueError(
+                "Edit components must be a subset of all auxiliary components."
+            )
         self._kwargs = kwargs
 
         self.components = {}
@@ -332,10 +503,12 @@ class DatetimeTransformer(ColumnTransformer):
         self._mean = None
         self._holidays = None
 
-    params = (set(inspect.signature(ColumnTransformer).parameters) |
-              set(inspect.signature(CategoricalTransformer.__init__).parameters) |
-              set(inspect.signature(NumericTransformer.__init__).parameters) |
-              set(inspect.signature(__init__).parameters)) - {"self", "kwargs"}
+    params = (
+        set(inspect.signature(ColumnTransformer).parameters)
+        | set(inspect.signature(CategoricalTransformer.__init__).parameters)
+        | set(inspect.signature(NumericTransformer.__init__).parameters)
+        | set(inspect.signature(__init__).parameters)
+    ) - {"self", "kwargs"}
 
     def _fit(self, data: pd.Series):
         self._mean = data.mean()
@@ -357,8 +530,16 @@ class DatetimeTransformer(ColumnTransformer):
 
     def _get_component(self, data: pd.Series, component: dt_components) -> pd.Series:
         if component in [
-            "year", "month", "day", "hour", "minute", "second", "nanosecond", "dayofweek",
-            "is_month_start", "is_month_end"
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "nanosecond",
+            "dayofweek",
+            "is_month_start",
+            "is_month_end",
         ]:
             result = getattr(data.dt, component)
             if component.startswith("is"):
@@ -375,7 +556,11 @@ class DatetimeTransformer(ColumnTransformer):
         elif component == "am_pm":
             return data.dt.hour.apply(lambda x: "am" if x < 12 else "pm")
         elif component == "is_holiday":
-            return data.dt.date.astype("datetime64[ns]").isin(self._holidays).astype("string")
+            return (
+                data.dt.date.astype("datetime64[ns]")
+                .isin(self._holidays)
+                .astype("string")
+            )
         else:
             raise ValueError(f"Component {component} is not recognized.")
 
@@ -383,7 +568,9 @@ class DatetimeTransformer(ColumnTransformer):
         result = {}
         for component_name, transformer in self.components.items():
             if isinstance(transformer, ColumnTransformer):
-                result[component_name] = transformer.standardize(self._get_component(data, component_name))
+                result[component_name] = transformer.standardize(
+                    self._get_component(data, component_name)
+                )
         num_data = (data - self._mean).dt.total_seconds()
         result["val"] = self.core_transformer.standardize(num_data)
         combined = pd.concat(result, axis=1)
@@ -407,14 +594,29 @@ class DatetimeTransformer(ColumnTransformer):
         return dat_data
 
     def _edit_component(
-            self, data: pd.Series, component: dt_components, component_data: Union[pd.Series, float, int, str]
+        self,
+        data: pd.Series,
+        component: dt_components,
+        component_data: Union[pd.Series, float, int, str],
     ) -> pd.Series:
         if component == "is_holiday":
-            raise ValueError("Component 'is_holiday' is not supported as basis of edition.")
+            raise ValueError(
+                "Component 'is_holiday' is not supported as basis of edition."
+            )
         if component == "month_name":
             month_name_map = {
-                "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
-                "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
+                "January": 1,
+                "February": 2,
+                "March": 3,
+                "April": 4,
+                "May": 5,
+                "June": 6,
+                "July": 7,
+                "August": 8,
+                "September": 9,
+                "October": 10,
+                "November": 11,
+                "December": 12,
             }
             if isinstance(component_data, pd.Series):
                 component_data = component_data.replace(month_name_map)
@@ -458,7 +660,9 @@ class DatetimeTransformer(ColumnTransformer):
             elif component_data == "False":
                 component_data = data.dt.day.clip(lower=2)
             else:
-                raise ValueError(f"Component is_month_start value {component_data} is invalid.")
+                raise ValueError(
+                    f"Component is_month_start value {component_data} is invalid."
+                )
             component = "day"
         elif component == "is_month_end":
             if isinstance(component_data, pd.Series):
@@ -475,12 +679,19 @@ class DatetimeTransformer(ColumnTransformer):
                 days_in_month = data.dt.daysinmonth
                 component_data = days.clip(upper=days_in_month - 1)
             else:
-                raise ValueError(f"Component is_month_end value {component_data} is invalid.")
+                raise ValueError(
+                    f"Component is_month_end value {component_data} is invalid."
+                )
             component = "day"
         elif component == "day_name":
             day_name_map = {
-                "Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
-                "Friday": 4, "Saturday": 5, "Sunday": 6
+                "Monday": 0,
+                "Tuesday": 1,
+                "Wednesday": 2,
+                "Thursday": 3,
+                "Friday": 4,
+                "Saturday": 5,
+                "Sunday": 6,
             }
             if isinstance(component_data, pd.Series):
                 component_data = component_data.replace(day_name_map)
@@ -488,7 +699,16 @@ class DatetimeTransformer(ColumnTransformer):
                 component_data = day_name_map[component_data]
             component = "dayofweek"
 
-        if component in ["year", "month", "day", "hour", "minute", "second", "microsecond", "nanosecond"]:
+        if component in [
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "microsecond",
+            "nanosecond",
+        ]:
             if isinstance(component_data, pd.Series):
                 if component == "year":
                     component_data = component_data.clip(1900, 2100)
@@ -510,18 +730,30 @@ class DatetimeTransformer(ColumnTransformer):
                     component_data = component_data.clip(0, 1000)
                 component_data = component_data.round().astype(np.int32)
                 if component in {"month", "year"}:
-                    new_date = pd.to_datetime(pd.DataFrame(
-                        {"year": data.dt.year, "month": data.dt.month, "day": 1} | {component: component_data}
-                    ))
-                    data = pd.DataFrame({
-                        "dat": data, "comp": component_data,
-                        "day": pd.DataFrame({"m": new_date.dt.daysinmonth, "a": data.dt.day}).min(axis=1)
-                    }).apply(
-                        lambda row: row["dat"].replace(**{component: row["comp"], "day": row["day"]}), axis=1
+                    new_date = pd.to_datetime(
+                        pd.DataFrame(
+                            {"year": data.dt.year, "month": data.dt.month, "day": 1}
+                            | {component: component_data}
+                        )
+                    )
+                    data = pd.DataFrame(
+                        {
+                            "dat": data,
+                            "comp": component_data,
+                            "day": pd.DataFrame(
+                                {"m": new_date.dt.daysinmonth, "a": data.dt.day}
+                            ).min(axis=1),
+                        }
+                    ).apply(
+                        lambda row: row["dat"].replace(
+                            **{component: row["comp"], "day": row["day"]}
+                        ),
+                        axis=1,
                     )
                 else:
                     data = pd.DataFrame({"dat": data, "comp": component_data}).apply(
-                        lambda row: row["dat"].replace(**{component: row["comp"]}), axis=1
+                        lambda row: row["dat"].replace(**{component: row["comp"]}),
+                        axis=1,
                     )
             else:
                 data = data.apply(lambda x: x.replace(**{component: component_data}))
@@ -530,7 +762,10 @@ class DatetimeTransformer(ColumnTransformer):
             addition = (component_data - original_component + 7) % 7
             subtraction = (component_data - original_component - 7) % 7
             day_diff = pd.DataFrame({"add": addition, "sub": subtraction}).apply(
-                lambda row: row["add"] if abs(row["add"]) < abs(row["sub"]) else row["sub"], axis=1
+                lambda row: (
+                    row["add"] if abs(row["add"]) < abs(row["sub"]) else row["sub"]
+                ),
+                axis=1,
             )
             day_diff = pd.to_timedelta(day_diff, unit="d")
             data = data + day_diff
@@ -553,7 +788,9 @@ class DatetimeTransformer(ColumnTransformer):
         result = {}
         for component_name, transformer in self.components.items():
             if isinstance(transformer, ColumnTransformer):
-                result[component_name] = transformer.normalize(self._get_component(data, component_name))
+                result[component_name] = transformer.normalize(
+                    self._get_component(data, component_name)
+                )
         num_data = (data - self._mean).dt.total_seconds()
         result["val"] = self.core_transformer.normalize(num_data)
         combined = pd.concat(result, axis=1)
