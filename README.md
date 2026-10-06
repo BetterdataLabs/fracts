@@ -1,5 +1,8 @@
 # FracTS Model for Times Series Generation
 
+This repository contains the official implementation of the paper
+**"FracTS: Hierarchical and Autoregressive Time Series Generation"**, accepted at **NeurIPS 2026**.
+
 FracTS model is a time series generative model using fractal generative model.
 
 # Quick Start
@@ -124,3 +127,22 @@ time series generative models. Key challenges in time series generations listed 
 
 [*] By "no limit", we mean we have not encountered a dataset that exceeds the capability of the model in our 
 experiments.
+
+## Citation
+
+If you use this code in your research, please cite our paper:
+
+```bibtex
+@inproceedings{
+li2026fracts,
+title={Frac{TS}: Hierarchical and Autoregressive Time Series Generation},
+author={Li, Jiayu and Afzal, Umair and Zhao, Zilong and Abdollahzadeh, Milad and Javaid, Uzair and Sikdar, Biplab},
+booktitle={The Fortieth Annual Conference on Neural Information Processing Systems},
+year={2026},
+url={https://openreview.net/forum?id=ptzy0mmiMh}
+}
+```
+
+## License
+
+This code is released for non-commercial research and academic purposes only. See [`LICENSE`](LICENSE) for details.
